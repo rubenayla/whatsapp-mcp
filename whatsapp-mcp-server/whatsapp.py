@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -46,6 +47,34 @@ class MessageContext:
     message: Message
     before: List[Message]
     after: List[Message]
+
+
+def connect_message_store() -> sqlite3.Connection:
+    """Open the message store with WhatsApp's LID-to-phone mappings attached."""
+    conn = sqlite3.connect(MESSAGES_DB_PATH)
+    conn.execute("ATTACH DATABASE ? AS whatsapp_store", (WHATSAPP_DB_PATH,))
+    return conn
+
+
+def resolve_contact_jids(conn: sqlite3.Connection, identifier: str) -> List[str]:
+    """Return all chat JIDs for a phone-number or LID contact identifier."""
+    user = identifier.split('@', 1)[0]
+    jids = {identifier}
+
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT lid, pn
+        FROM whatsapp_store.whatsmeow_lid_map
+        WHERE lid = ? OR pn = ?
+        """,
+        (user, user),
+    )
+    for lid, phone_number in cursor.fetchall():
+        jids.add(f"{lid}@lid")
+        jids.add(f"{phone_number}@s.whatsapp.net")
+
+    return list(jids)
 
 def get_sender_name(sender_jid: str) -> str:
     try:
@@ -393,23 +422,33 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
         search_pattern = '%' +query + '%'
         
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
+            SELECT
+                c.jid,
+                COALESCE(NULLIF(contact.full_name, ''), NULLIF(c.name, ''), c.jid) AS name
+            FROM chats c
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON c.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(
+                    lid_map.pn || '@s.whatsapp.net',
+                    c.jid
+                )
+            WHERE c.jid NOT LIKE '%@g.us'
+                AND (
+                    LOWER(COALESCE(contact.full_name, c.name, c.jid)) LIKE LOWER(?)
+                    OR LOWER(c.jid) LIKE LOWER(?)
+                    OR LOWER(COALESCE(lid_map.pn, '')) LIKE LOWER(?)
+                )
+            ORDER BY c.last_message_time DESC, name, c.jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
+        """, (search_pattern, search_pattern, search_pattern))
         
         contacts = cursor.fetchall()
         
@@ -441,8 +480,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         page: Page number for pagination (default 0)
     """
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
+        contact_jids = resolve_contact_jids(conn, jid)
+        placeholders = ', '.join('?' for _ in contact_jids)
         
         cursor.execute("""
             SELECT DISTINCT
@@ -454,10 +495,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """.format(placeholders=placeholders), (*contact_jids, *contact_jids, limit, page * limit))
         
         chats = cursor.fetchall()
         
@@ -486,8 +527,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
+        contact_jids = resolve_contact_jids(conn, jid)
+        placeholders = ', '.join('?' for _ in contact_jids)
         
         cursor.execute("""
             SELECT 
@@ -501,10 +544,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """.format(placeholders=placeholders), (*contact_jids, *contact_jids))
         
         msg_data = cursor.fetchone()
         
@@ -583,8 +626,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
+        contact_jids = resolve_contact_jids(conn, sender_phone_number)
+        placeholders = ', '.join('?' for _ in contact_jids)
         
         cursor.execute("""
             SELECT 
@@ -597,9 +642,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid IN ({placeholders}) AND c.jid NOT LIKE '%@g.us'
+            ORDER BY c.last_message_time DESC
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """.format(placeholders=placeholders), contact_jids)
         
         chat_data = cursor.fetchone()
         
