@@ -78,14 +78,18 @@ def resolve_contact_jids(conn: sqlite3.Connection, identifier: str) -> List[str]
 
 def get_sender_name(sender_jid: str) -> str:
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
         
         # First try matching by exact JID
         cursor.execute("""
-            SELECT name
+            SELECT COALESCE(NULLIF(contact.full_name, ''), chats.name)
             FROM chats
-            WHERE jid = ?
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON chats.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', chats.jid)
+            WHERE chats.jid = ?
             LIMIT 1
         """, (sender_jid,))
         
@@ -100,9 +104,14 @@ def get_sender_name(sender_jid: str) -> str:
                 phone_part = sender_jid
                 
             cursor.execute("""
-                SELECT name
+                SELECT COALESCE(NULLIF(contact.full_name, ''), chats.name)
                 FROM chats
-                WHERE jid LIKE ?
+                LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                    ON chats.jid = lid_map.lid || '@lid'
+                LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                    ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', chats.jid)
+                WHERE chats.jid LIKE ?
+                ORDER BY chats.last_message_time DESC
                 LIMIT 1
             """, (f"%{phone_part}%",))
             
@@ -164,12 +173,20 @@ def list_messages(
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        query_parts = ["""
+            SELECT messages.timestamp, messages.sender,
+                COALESCE(NULLIF(contact.full_name, ''), chats.name),
+                messages.content, messages.is_from_me, chats.jid,
+                messages.id, messages.media_type
+            FROM messages
+        """]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
+        query_parts.append("LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map ON chats.jid = lid_map.lid || '@lid'")
+        query_parts.append("LEFT JOIN whatsapp_store.whatsmeow_contacts contact ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', chats.jid)")
         where_clauses = []
         params = []
         
@@ -354,19 +371,23 @@ def list_chats(
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = connect_message_store()
         cursor = conn.cursor()
         
         # Build base query
         query_parts = ["""
             SELECT 
                 chats.jid,
-                chats.name,
+                COALESCE(NULLIF(contact.full_name, ''), chats.name) AS name,
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
                 messages.is_from_me as last_is_from_me
             FROM chats
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON chats.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', chats.jid)
         """]
         
         if include_last_message:
@@ -379,7 +400,7 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+            where_clauses.append("(LOWER(COALESCE(NULLIF(contact.full_name, ''), chats.name)) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
             
         if where_clauses:
@@ -486,16 +507,24 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         placeholders = ', '.join('?' for _ in contact_jids)
         
         cursor.execute("""
-            SELECT DISTINCT
+            SELECT
                 c.jid,
-                c.name,
+                COALESCE(NULLIF(contact.full_name, ''), c.name),
                 c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                last_message.content,
+                last_message.sender,
+                last_message.is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON c.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', c.jid)
+            LEFT JOIN messages last_message
+                ON last_message.chat_jid = c.jid AND last_message.timestamp = c.last_message_time
+            WHERE c.jid IN ({placeholders}) OR EXISTS (
+                SELECT 1 FROM messages participant
+                WHERE participant.chat_jid = c.jid AND participant.sender IN ({placeholders})
+            )
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
         """.format(placeholders=placeholders), (*contact_jids, *contact_jids, limit, page * limit))
@@ -536,7 +565,7 @@ def get_last_interaction(jid: str) -> str:
             SELECT 
                 m.timestamp,
                 m.sender,
-                c.name,
+                COALESCE(NULLIF(contact.full_name, ''), c.name),
                 m.content,
                 m.is_from_me,
                 c.jid,
@@ -544,6 +573,10 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON c.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', c.jid)
             WHERE m.sender IN ({placeholders}) OR c.jid IN ({placeholders})
             ORDER BY m.timestamp DESC
             LIMIT 1
@@ -634,12 +667,16 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         cursor.execute("""
             SELECT 
                 c.jid,
-                c.name,
+                COALESCE(NULLIF(contact.full_name, ''), c.name),
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
+            LEFT JOIN whatsapp_store.whatsmeow_lid_map lid_map
+                ON c.jid = lid_map.lid || '@lid'
+            LEFT JOIN whatsapp_store.whatsmeow_contacts contact
+                ON contact.their_jid = COALESCE(lid_map.pn || '@s.whatsapp.net', c.jid)
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
             WHERE c.jid IN ({placeholders}) AND c.jid NOT LIKE '%@g.us'
