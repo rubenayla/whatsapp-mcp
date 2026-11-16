@@ -185,8 +185,35 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
+	// Business reminders and confirmations commonly arrive as hydrated
+	// templates, whose body is not stored in Conversation or ExtendedText.
+	if template := msg.GetTemplateMessage(); template != nil {
+		hydrated := template.GetHydratedFourRowTemplate()
+		if hydrated == nil {
+			hydrated = template.GetHydratedTemplate()
+		}
+		if hydrated != nil {
+			parts := []string{
+				hydrated.GetHydratedTitleText(),
+				hydrated.GetHydratedContentText(),
+				hydrated.GetHydratedFooterText(),
+			}
+			return strings.Join(nonEmptyStrings(parts), "\n")
+		}
+	}
+
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+func nonEmptyStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			result = append(result, value)
+		}
+	}
+	return result
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -403,6 +430,20 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+	}
+
+	// Template media is nested in the template title rather than at the
+	// top level, so handle it separately from ordinary image messages.
+	if template := msg.GetTemplateMessage(); template != nil {
+		hydrated := template.GetHydratedFourRowTemplate()
+		if hydrated == nil {
+			hydrated = template.GetHydratedTemplate()
+		}
+		if hydrated != nil && hydrated.GetImageMessage() != nil {
+			img := hydrated.GetImageMessage()
+			return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+				img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
+		}
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -1054,14 +1095,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
